@@ -13,6 +13,11 @@ from tools.llamaindex_tool import get_llamaindex_tool
 
 RAG_PAGE_INTRODUCTION = "你好，我是智能助手，当前页面为`RAG 对话模式`，可以在对话让大模型基于左侧所选知识库进行回答，有什么可以帮助你的吗？"
 
+# --- ✅ 新增：定义一个带缓存的加载函数 ---
+@st.cache_resource(show_spinner=False)
+def load_kb_tool(kb_name, kb_path):
+    return get_llamaindex_tool(kb_name, kb_path)
+
 # Graph Response 处理逻辑保持不变
 def graph_response(graph, input):
     for event in graph.stream(
@@ -145,7 +150,11 @@ def display_chat_history():
                             st.code(tool_call["query"], wrap_lines=True)
                         st.write("知识库检索结果：")
                         # 简化显示逻辑，适配 LlamaIndex 的返回
-                        st.write(tool_call["content"])
+                        content = tool_call.get("content") # 使用 .get() 安全获取
+                        if content:
+                            st.write(content)
+                        else:
+                            st.warning("⚠️ 工具调用中断或未返回结果")
             st.write(message["content"])
 
 def clear_chat_history():
@@ -165,14 +174,19 @@ def rag_chat_page():
     KBS = dict()
     kb_root = Path(__file__).resolve().parents[1] / "kb"
     
-    # 遍历加载知识库工具 (LlamaIndex)
+    # --- ✅ 修改点 3：使用缓存加载工具 ---
+    # 遍历加载知识库工具
     for k in kbs:
         kb_path = kb_root / k
-        tool = get_llamaindex_tool(k, kb_path)
+        # 这里改用了 load_kb_tool (带缓存)，而不是直接调用 get_llamaindex_tool
+        tool = load_kb_tool(k, kb_path)
         if tool:
             KBS[k] = tool
         else:
-            st.warning(f"知识库 {k} 加载失败或不存在有效索引，已跳过该知识库。")
+            # 这里可以改用 toast 或者 info，避免 warning 太多太吵
+            # st.warning(f"知识库 {k} 加载失败，已跳过。")
+            pass
+    # ----------------------------------
 
     if "rag_chat_history" not in st.session_state:
         st.session_state["rag_chat_history"] = [
@@ -187,11 +201,7 @@ def rag_chat_page():
 
     # 侧边栏配置
     with st.sidebar:
-        selected_kbs = st.multiselect("请选择对话中可使用的知识库", kbs, default=kbs)
-        
-        # --- 修改点 3：移除了 "重排序配置" ---
-        # 理由：目前的架构使用 LlamaIndex 内部封装，外部的 rerank_type 暂时无法传进去
-        # 如果需要重排序，应该在 get_llamaindex_tool 内部配置
+        selected_kbs = st.sidebar.multiselect("请选择知识库", kbs)
         
         st.divider()
         st.subheader("平台配置")
@@ -205,7 +215,7 @@ def rag_chat_page():
         platform = st.selectbox("请选择要使用的模型加载方式", PLATFORMS)
         # 获取模型列表
         llm_models = get_llm_models(platform, st.session_state.get("base_url", ""), st.session_state.get("api_key", ""))
-        # 增加判空保护
+        
         if not llm_models:
             llm_models = ["加载失败或列表为空"]
         
@@ -214,7 +224,11 @@ def rag_chat_page():
         history_len = st.slider("请选择历史消息长度", 1, 10, 5)
         
     input = cols[1].chat_input("请输入您的问题")
-    cols[2].button(":wastebasket:", help="清空对话", on_click=clear_chat_history)
+    cols[2].button(":wastebasket:", help="清空对话", on_click=lambda: st.session_state.update({
+        "rag_chat_history": [{"role": "assistant", "content": RAG_PAGE_INTRODUCTION}],
+        "rag_chat_history_with_tool_call": [{"role": "assistant", "content": RAG_PAGE_INTRODUCTION}],
+        "rag_tool_calls": []
+    }))
     
     if input:
         with st.chat_message("user"):
@@ -235,6 +249,14 @@ def rag_chat_page():
 
         with st.chat_message("assistant", avatar=get_img_base64("robot.png")):
             response = st.write_stream(stream_response)
+        
         st.session_state["rag_chat_history"] += [{"role": 'assistant', "content": response}]
-        st.session_state["rag_chat_history_with_tool_call"] += [{"role": 'assistant', "content": response, "tool_calls": st.session_state["rag_tool_calls"]}]
+        
+        # 将本次对话的工具调用记录合并保存
+        st.session_state["rag_chat_history_with_tool_call"] += [{
+            "role": 'assistant', 
+            "content": response, 
+            "tool_calls": st.session_state["rag_tool_calls"]
+        }]
+        # 清空临时工具调用列表，为下一轮对话做准备
         st.session_state["rag_tool_calls"] = []

@@ -16,12 +16,13 @@ from llama_index.core import (
 )
 
 # 1. 保存配置
-def save_config_to_json(kb_path, platform, embedding_model, rerank_model):
+def save_config_to_json(kb_path, platform, embedding_model, rerank_model, rerank_api_key=""): 
     config_path = kb_path / "config.json"
     config_data = {
         "platform": platform,
         "embedding_model": embedding_model,
-        "rerank_model": rerank_mode
+        "rerank_model": rerank_model,
+        "rerank_api_key": rerank_api_key # 新增保存 API Key
     }
     with open(config_path, "w") as f:
         json.dump(config_data, f)
@@ -48,7 +49,9 @@ def build_knowledge_base(kb_path, file_storage_path, platform, embedding_model):
     success = config_llama_index(platform, embedding_model)
     if not success:
         raise Exception("LlamaIndex 模型配置失败，请检查 utils.py 或环境配置")
-
+    Settings.embed_batch_size = 100
+    Settings.chunk_size = 1024 
+    Settings.chunk_overlap = 50
     try:
         # B. 使用 SimpleDirectoryReader 自动加载目录下所有文件
         # recursive=True 允许读取子目录（虽然目前逻辑只存根目录）
@@ -101,8 +104,13 @@ def knowledge_base_page():
             platform = cols[0].selectbox("请选择 Embedding 平台", PLATFORMS)
             embedding_models = get_embedding_models(platform)
             embedding_model = cols[1].selectbox("请选择 Embedding 模型", embedding_models)
-            rerank_options = ["None", "BAAI/bge-reranker-base", "BAAI/bge-reranker-large"] 
+            rerank_options = ["None", "BAAI/bge-reranker-base", "BAAI/bge-reranker-large", "Cohere", "JinaAI"] 
             rerank_model = st.selectbox("请选择重排序模型 (Rerank)", rerank_options)
+            
+            rerank_api_key = ""
+            if rerank_model in ["Cohere", "JinaAI"]:
+                rerank_api_key = st.text_input(f"请输入 {rerank_model} API Key", type="password")
+
             
             submit = st.button("创建知识库")
             
@@ -128,7 +136,7 @@ def knowledge_base_page():
                 vs_path.mkdir()
                 
                 # 保存配置
-                save_config_to_json(kb_path, platform, embedding_model, rerank_model)
+                save_config_to_json(kb_path, platform, embedding_model, rerank_model, rerank_api_key)
 
                 st.success(f"创建知识库 {kb_name} 成功")
                 s.update(label=f'已创建知识库"{kb_name}"', expanded=False, state="complete")

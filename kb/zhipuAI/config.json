@@ -1,0 +1,1 @@
+{"platform": "ZhipuAI", "embedding_model": "embedding-2", "rerank_model": "BAAI/bge-reranker-base", "rerank_api_key": ""}
