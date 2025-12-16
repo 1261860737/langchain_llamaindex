@@ -8,20 +8,57 @@ from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.retrievers.bm25 import BM25Retriever
 from llama_index.core.postprocessor import SentenceTransformerRerank
 
-# --- ✅ 关键修改：引入 OpenAILike 代替 OpenAI ---
-# OpenAILike 不会校验模型名称，适合 DashScope/DeepSeek 等兼容接口
+# 引入 Query 泛化所需的 LangChain 组件
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate, FewShotChatMessagePromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+# 引入 OpenAILike
 try:
     from llama_index.llms.openai_like import OpenAILike
 except ImportError:
-    # 如果没安装，尝试回退或提示（通常 llama-index-llms-openai-like 包是自带的或需单独安）
     OpenAILike = None
 
-# 引入 utils 中的函数来构建 embedding model
 from utils import get_embedding_model
 try:
     from llama_index.embeddings.langchain import LangchainEmbedding
 except ImportError:
     LangchainEmbedding = None
+
+# --- ✅ 新增：Query 泛化函数 ---
+def stepback_prompting_expansion(query: str, api_key: str = None) -> str:
+    """利用 LLM 将具体问题泛化为通用问题"""
+    try:
+        if not api_key: return query
+        
+        examples = [
+            {"input": "这篇关于Transformer的论文是如何解决长文本效率低下的？", "output": "LLM处理超长文本时的主要挑战和架构改进方案有哪些？"},
+            {"input": "指令微调对提升模型在数学任务上的表现有帮助吗？", "output": "指令微调在提升LLM特定任务能力方面扮演了什么角色？"},
+        ]
+        example_prompt = ChatPromptTemplate.from_messages([("human", "{input}"), ("ai", "{output}")])
+        few_shot_prompt = FewShotChatMessagePromptTemplate(example_prompt=example_prompt, examples=examples)
+        
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "你是一个文献检索专家，请将用户的具体问题泛化为更适合检索的通用问题。仅返回泛化后的问题。"),
+            few_shot_prompt,
+            ("user", "{question}"),
+        ])
+        
+        # 使用 DashScope 进行泛化 (因为用户现在主要用这个)
+        llm = ChatOpenAI(
+            model="qwen-plus", 
+            temperature=0.1, 
+            openai_api_key=api_key, 
+            openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1"
+        )
+        chain = prompt | llm | StrOutputParser()
+        expanded_query = chain.invoke({"question": query})
+        print(f"🔄 Query 泛化: {query} -> {expanded_query}")
+        return expanded_query
+    except Exception as e:
+        print(f"⚠️ 泛化失败: {e}")
+        return query
+# --------------------------------
 
 def get_llamaindex_tool(kb_name, kb_path):
     vs_path = Path(kb_path) / "vectorstore"
@@ -32,7 +69,6 @@ def get_llamaindex_tool(kb_name, kb_path):
         return None
 
     try:
-        # 1. 读取配置
         config = {}
         if config_path.exists():
             with open(config_path, "r") as f:
@@ -42,46 +78,31 @@ def get_llamaindex_tool(kb_name, kb_path):
         kb_embed_model_name = config.get("embedding_model", "text-embedding-3-small")
         rerank_model_name = config.get("rerank_model", "None")
 
-        # 2. 配置 Embedding 模型
+        # 1. 配置 Embedding
         embed_model = None
         if LangchainEmbedding:
-            lc_embed = get_embedding_model(
-                platform_type=kb_platform,
-                model=kb_embed_model_name
-            )
+            lc_embed = get_embedding_model(platform_type=kb_platform, model=kb_embed_model_name)
             embed_model = LangchainEmbedding(lc_embed)
 
-        # --- ✅ 新增：配置 OpenAILike LLM (绕过模型名验证) ---
+        # 2. 配置 LLM (使用 OpenAILike 绕过验证)
         api_key = os.getenv("DASHSCOPE_API_KEY")
-        base_url = os.getenv("DASHSCOPE_BASE_URL")
-        if not api_key:
-            print("⚠️ 未检测到 DASHSCOPE_API_KEY，LlamaIndex 可能无法生成回答。")
-        
-        if OpenAILike:
+        if OpenAILike and api_key:
             llm = OpenAILike(
-                model="qwen-plus",  # 现在可以随意传模型名了
+                model="qwen-plus",
                 api_key=api_key,
-                api_base=base_url,
-                is_chat_model=True, # 声明这是对话模型
+                api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
+                is_chat_model=True,
                 temperature=0.1,
-                timeout=120.0,      # 超时时间
-                max_retries=2,
-                reuse_client=False
+                timeout=120.0,
+                max_retries=2
             )
-            # 将配置应用到全局
             Settings.llm = llm
-        else:
-            print("❌ 缺少 llama-index-llms-openai-like 库，请运行 `pip install llama-index-llms-openai-like`")
-        # -----------------------------------------------------------
 
         # 3. 加载索引
         storage_context = StorageContext.from_defaults(persist_dir=str(vs_path))
-        index = load_index_from_storage(
-            storage_context, 
-            embed_model=embed_model 
-        )
+        index = load_index_from_storage(storage_context, embed_model=embed_model)
 
-        # 4. 构建混合检索
+        # 4. 混合检索
         vector_retriever = VectorIndexRetriever(index=index, similarity_top_k=6)
         bm25_retriever = BM25Retriever.from_defaults(docstore=index.docstore, similarity_top_k=6)
         
@@ -108,18 +129,20 @@ def get_llamaindex_tool(kb_name, kb_path):
             try:
                 reranker = SentenceTransformerRerank(model=rerank_model_name, top_n=3)
                 node_postprocessors.append(reranker)
-            except Exception as e:
-                print(f"重排序模型加载失败: {e}")
+            except Exception: pass
 
-        # 6. 转换为 Query Engine
+        # 6. 查询引擎
         query_engine = RetrieverQueryEngine.from_args(
             retriever=hybrid_retriever,
             node_postprocessors=node_postprocessors,
-            llm=llm  # 显式传入 OpenAILike LLM
+            llm=llm
         )
         
         def query_func(query: str) -> str:
-            response = query_engine.query(query)
+            # --- ✅ 恢复调用泛化逻辑 ---
+            # 只有当 query 比较短或者意图不明确时才泛化，这里简单全部尝试
+            final_query = stepback_prompting_expansion(query, api_key=api_key)
+            response = query_engine.query(final_query)
             return str(response)
 
         return Tool(
